@@ -1,0 +1,21 @@
+name: Build iPhone Studio IPA
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build unsigned app
+        working-directory: iOS
+        run: |
+          xcodegen generate
+          xcodebuild -project iPhoneStudio.xcodeproj -scheme iPhoneStudio -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/iPhoneStudio.app Payload/
+          zip -r iPhoneStudio.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneStudio-IPA
+          path: iOS/iPhoneStudio.ipa
