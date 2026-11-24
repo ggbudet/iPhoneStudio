@@ -4,3 +4,5 @@ pymobiledevice3
 
 av
 numpy
+
+pyvirtualcam>=0.14,<1
