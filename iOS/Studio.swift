@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import Network
 import CoreImage
+import VideoToolbox
 import UIKit
 
 @main struct StudioApp: App {
@@ -20,7 +21,11 @@ final class Camera: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBu
     let network = DispatchQueue(label: "studio.network")
     let session = AVCaptureSession(), preview = AVCaptureVideoDataOutput(), movie = AVCaptureMovieFileOutput()
     let ci = CIContext(); let lock = NSLock()
-    var jpeg = Data(), lastFrame = Date.distantPast, listener: NWListener?, input: AVCaptureDeviceInput?, audio: AVCaptureDeviceInput?, booted = false
+    var encoder: VTCompressionSession?, encoderWidth: Int32 = 0, encoderHeight: Int32 = 0
+    var streamClient: NWConnection?, streamBusy = false, streamGeneration = 0
+    var forceKey = true, previewFPS = 30
+    var encoderGeneration = 0
+    var listener: NWListener?, input: AVCaptureDeviceInput?, audio: AVCaptureDeviceInput?, booted = false
     var pendingStop: ((Data)->Void)?, pendingStart: ((Data)->Void)?, finishedURL: URL?
     func say(_ s:String) { DispatchQueue.main.async { self.status = s } }
     func cameras() -> [AVCaptureDevice] { AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera,.builtInUltraWideCamera,.builtInTelephotoCamera,.builtInTrueDepthCamera], mediaType: .video, position: .unspecified).devices }
@@ -45,10 +50,92 @@ final class Camera: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBu
     func json(_ obj:[String:Any])->Data { (try? JSONSerialization.data(withJSONObject:obj)) ?? Data() }
     func ok()->Data {json(["ok":true])}
     func error(_ s:String)->Data {json(["ok":false,"error":s])}
+    // All encoder and stream state is confined to the frames queue.
+    func resetEncoder() {
+        encoderGeneration += 1
+        if let e = encoder { VTCompressionSessionInvalidate(e) }; encoder = nil
+        forceKey = true
+    }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard Date().timeIntervalSince(lastFrame)>0.08, let px=CMSampleBufferGetImageBuffer(sampleBuffer) else{return}; lastFrame=Date()
-        var image=CIImage(cvPixelBuffer:px); let scale=min(1,960/image.extent.width); image=image.transformed(by:CGAffineTransform(scaleX:scale,y:scale))
-        guard let cg=ci.createCGImage(image,from:image.extent), let data=UIImage(cgImage:cg).jpegData(compressionQuality:0.65) else{return}; lock.lock(); jpeg=data; lock.unlock()
+        guard streamClient != nil, !streamBusy, let px = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let w = CVPixelBufferGetWidth(px), h = CVPixelBufferGetHeight(px)
+        let scale = min(1.0, 1920.0 / Double(max(w,h)))
+        let ew = Int32(Double(w)*scale)/2*2, eh = Int32(Double(h)*scale)/2*2
+        if encoder == nil || encoderWidth != ew || encoderHeight != eh {
+            resetEncoder(); encoderWidth = ew; encoderHeight = eh
+            var e: VTCompressionSession?
+            let result = VTCompressionSessionCreate(allocator: nil, width: ew, height: eh, codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &e)
+            guard result == noErr, let e = e else { return }; encoder = e
+            VTSessionSetProperty(e, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+            VTSessionSetProperty(e, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+            VTSessionSetProperty(e, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+            VTSessionSetProperty(e, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: 10000000))
+            VTSessionSetProperty(e, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: previewFPS))
+            VTSessionSetProperty(e, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: previewFPS))
+            VTCompressionSessionPrepareToEncodeFrames(e)
+        }
+        guard let e = encoder else { return }
+        var source = px
+        if w != Int(ew) || h != Int(eh) {
+            guard let pool = VTCompressionSessionGetPixelBufferPool(e) else { return }
+            var resized: CVPixelBuffer?
+            guard CVPixelBufferPoolCreatePixelBuffer(nil,pool,&resized) == kCVReturnSuccess, let resized = resized else { return }
+            let image = CIImage(cvPixelBuffer:px).transformed(by:CGAffineTransform(scaleX:CGFloat(ew)/CGFloat(w),y:CGFloat(eh)/CGFloat(h)))
+            ci.render(image,to:resized); source = resized
+        }
+        let generation = streamGeneration, epoch = encoderGeneration
+        let props = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
+        forceKey = false
+        let result = VTCompressionSessionEncodeFrame(e, imageBuffer: source, presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sample in
+            guard status == noErr, let sample = sample, let bytes = Self.annexB(sample) else { return }
+            self?.frames.async { [weak self] in guard let self = self, self.encoderGeneration == epoch else { return }; self.pushVideo(bytes, generation) }
+        }
+        if result != noErr { resetEncoder() }
+    }
+    static func annexB(_ sample: CMSampleBuffer) -> Data? {
+        guard let fmt = CMSampleBufferGetFormatDescription(sample), let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
+        var count = 0; var length: Int32 = 0
+        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &length) == noErr, length == 4 else { return nil }
+        let prefix = Data([0,0,0,1]); var out = Data()
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary:false) as? [[String:Any]]
+        if attachments?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool != true {
+            for i in 0..<count {
+                var ptr: UnsafePointer<UInt8>?; var size = 0
+                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex:i, parameterSetPointerOut:&ptr, parameterSetSizeOut:&size, parameterSetCountOut:nil, nalUnitHeaderLengthOut:nil) == noErr, let ptr = ptr { out.append(prefix); out.append(Data(bytes:ptr,count:size)) }
+            }
+        }
+        let size = CMBlockBufferGetDataLength(block); guard size >= 4 else { return nil }; var raw = Data(count:size)
+        let result = raw.withUnsafeMutableBytes { b in CMBlockBufferCopyDataBytes(block, atOffset:0, dataLength:size, destination:b.baseAddress!) }
+        guard size >= 4, result == kCMBlockBufferNoErr else { return nil }
+        var offset = 0
+        while offset+4 <= size {
+            let n = Int(raw[offset])<<24 | Int(raw[offset+1])<<16 | Int(raw[offset+2])<<8 | Int(raw[offset+3]); offset += 4
+            guard n > 0, n <= size-offset else { return nil }; out.append(prefix); out.append(raw[offset..<offset+n]); offset += n
+        }
+        return out
+    }
+    func pushVideo(_ bytes:Data, _ generation:Int) {
+        guard generation == streamGeneration, let c = streamClient else { return }
+        if streamBusy { forceKey = true; return }
+        streamBusy = true
+        // Length-prefixed access units avoid parser buffering on the PC.
+        var n = UInt32(bytes.count).bigEndian; var packet = withUnsafeBytes(of:&n){Data($0)}; packet.append(bytes)
+        c.send(content:packet,completion:.contentProcessed{ [weak self] err in
+            self?.frames.async { [weak self] in
+                guard let self = self, generation == self.streamGeneration else { return }
+                self.streamBusy = false
+                if err != nil { c.cancel(); self.streamClient = nil; self.resetEncoder() }
+            }
+        })
+    }
+    func openVideo(_ c:NWConnection) {
+        frames.async {
+            self.streamClient?.cancel(); self.streamGeneration += 1; self.streamClient = c; self.streamBusy = true; self.resetEncoder()
+            let generation = self.streamGeneration
+            c.send(content:Data("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n".utf8),completion:.contentProcessed{err in
+                self.frames.async { guard generation == self.streamGeneration else { return }; self.streamBusy = false; if err != nil { c.cancel(); self.streamClient = nil } }
+            })
+        }
     }
     func configure(_ p:[String:Any]) throws {
         guard !movie.isRecording, pendingStart == nil, pendingStop == nil else {throw Fail("Остановите запись")}
@@ -61,6 +148,7 @@ final class Camera: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBu
         }
         try device.lockForConfiguration(); defer{device.unlockForConfiguration()}
         device.activeFormat=format; let duration=CMTime(value:1,timescale:Int32(fps));device.activeVideoMinFrameDuration=duration;device.activeVideoMaxFrameDuration=duration
+        frames.async { self.previewFPS = fps; self.resetEncoder() }
         func n(_ k:String,_ fallback:Double)->Double{(p[k] as? NSNumber)?.doubleValue ?? fallback}
         if p["autoFocus"] as? Bool == true {if device.isFocusModeSupported(.continuousAutoFocus){device.focusMode = .continuousAutoFocus}} else if device.isLockingFocusWithCustomLensPositionSupported {device.setFocusModeLocked(lensPosition:Float(min(1,max(0,n("focus",0.5)))),completionHandler:nil)} else {throw Fail("Ручной фокус недоступен")}
         if p["autoExposure"] as? Bool == true {if device.isExposureModeSupported(.continuousAutoExposure){device.exposureMode = .continuousAutoExposure};device.setExposureTargetBias(Float(min(Double(device.maxExposureTargetBias),max(Double(device.minExposureTargetBias),n("ev",0)))),completionHandler:nil)} else if device.isExposureModeSupported(.custom){let seconds=min(min(CMTimeGetSeconds(format.maxExposureDuration),1/Double(fps)),max(CMTimeGetSeconds(format.minExposureDuration),1/max(1,n("shutter",60))));device.setExposureModeCustom(duration:CMTime(seconds:seconds,preferredTimescale:1000000),iso:Float(min(Double(format.maxISO),max(Double(format.minISO),n("iso",100)))),completionHandler:nil)} else {throw Fail("Ручная экспозиция недоступна")}
@@ -74,9 +162,9 @@ final class Camera: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBu
     func send(_ c:NWConnection,_ data:Data,_ type:String="application/json",_ code:String="200 OK"){let h=Data("HTTP/1.1 \(code)\r\nContent-Type: \(type)\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n".utf8);c.send(content:h+data,completion:.contentProcessed{_ in c.cancel()})}
     func stream(_ c:NWConnection,_ url:URL){do{let f=try FileHandle(forReadingFrom:url);let count=try f.seekToEnd();try f.seek(toOffset:0);let h=Data("HTTP/1.1 200 OK\r\nContent-Type: video/quicktime\r\nContent-Length: \(count)\r\nConnection: close\r\n\r\n".utf8);func next(){do{let d=try f.read(upToCount:262144) ?? Data();if d.isEmpty{try? f.close();c.cancel();return};c.send(content:d,completion:.contentProcessed{err in if err==nil{next()}else{try? f.close();c.cancel()}})}catch{try? f.close();c.cancel()}};c.send(content:h,completion:.contentProcessed{err in if err==nil{next()}else{try? f.close();c.cancel()}})}catch{send(c,self.error(error.localizedDescription),"application/json","500 Error")}}
     func route(_ c:NWConnection,_ method:String,_ path:String,_ body:Data){
-        if method=="GET" && path=="/preview"{lock.lock();let d=jpeg;lock.unlock();send(c,d,"image/jpeg",d.isEmpty ? "503 Waiting":"200 OK");return}
+        if method=="GET" && path=="/live" { openVideo(c); return }
         queue.async{let reply:(Data)->Void={self.send(c,$0)};switch (method,path){
-        case ("GET","/info"):reply(self.json(["cameras":self.cameras().map{["id":$0.uniqueID,"name":$0.localizedName]},"active":self.input?.device.uniqueID ?? ""]))
+        case ("GET","/info"):reply(self.json(["cameras":self.cameras().map{["id":$0.uniqueID,"name":$0.localizedName]},"active":self.input?.device.uniqueID ?? "", "protocol":2]))
         case ("POST","/settings"):do{try self.configure((try JSONSerialization.jsonObject(with:body)) as? [String:Any] ?? [:]);reply(self.ok())}catch{reply(self.error(error.localizedDescription))}
         case ("POST","/start"):guard !self.movie.isRecording,self.pendingStart==nil,self.pendingStop==nil else{reply(self.error("Уже идёт запись"));return};self.pendingStart=reply;let url=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString+".mov");self.movie.startRecording(to:url,recordingDelegate:self)
         case ("POST","/stop"):guard self.movie.isRecording,self.pendingStop==nil else{reply(self.error("Нет активной записи"));return};self.pendingStop=reply;self.movie.stopRecording()

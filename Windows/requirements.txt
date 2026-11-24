@@ -1,3 +1,6 @@
 PySide6
 requests
 pymobiledevice3
+
+av
+numpy
